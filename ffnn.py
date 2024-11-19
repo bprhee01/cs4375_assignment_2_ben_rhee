@@ -38,7 +38,7 @@ class FFNN(nn.Module):
         output_layer = self.W2(hidden_layer)
 
         # [to fill] obtain probability dist.
-        predicted_vector= self.softmax(output_layer)
+        predicted_vector = self.softmax(output_layer)
 
         return predicted_vector
 

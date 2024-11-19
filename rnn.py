@@ -17,29 +17,87 @@ unk = '<UNK>'
 # Consult the PyTorch documentation for information on the functions used below:
 # https://pytorch.org/docs/stable/torch.html
 class RNN(nn.Module):
-    def __init__(self, input_dim, h):  # Add relevant parameters
+    def __init__(self, input_dim, h):
         super(RNN, self).__init__()
         self.h = h
-        self.numOfLayer = 1
-        self.rnn = nn.RNN(input_dim, h, self.numOfLayer, nonlinearity='tanh')
+        self.numOfLayer = 2 # Increased number of layers
+        
+        # Reduced dropout rates
+        self.dropout = 0.2
+        self.embedding_dropout = nn.Dropout(0.1)
+        
+        # Attention mechanism
+        self.attention = nn.MultiheadAttention(h * 2, num_heads=4, dropout=0.1)
+        
+        # Made it to Bidirectional LSTM
+        self.rnn = nn.LSTM(input_dim, h, self.numOfLayer,
+                          dropout=self.dropout,
+                          bidirectional=True,
+                          batch_first=False)
+        
+        # Layer normalization
+        self.layer_norm1 = nn.LayerNorm(h * 2)
+        self.layer_norm2 = nn.LayerNorm(h * 2)
+        
+        # Output layers
+        self.output_dropout = nn.Dropout(0.1)
+        self.intermediate = nn.Linear(h * 2, h)
+        self.activation = nn.ReLU()
         self.W = nn.Linear(h, 5)
+
+        # Initialize weights
+        self._initialize_weights()
+
         self.softmax = nn.LogSoftmax(dim=1)
-        self.loss = nn.NLLLoss()
+        # Added label smoothing
+        self.loss = nn.CrossEntropyLoss(label_smoothing=0.1) ## Label smoothing
+
+    ## added proper weight initialization
+    def _initialize_weights(self):
+        for name, param in self.rnn.named_parameters():
+            if 'weight' in name:
+                init.orthogonal_(param, gain=0.8)
+            elif 'bias' in name:
+                init.zeros_(param)
+        
+        init.xavier_uniform_(self.intermediate.weight, gain=0.8)
+        init.zeros_(self.intermediate.bias)
+        init.xavier_uniform_(self.W.weight, gain=0.8)
+        init.zeros_(self.W.bias)
 
     def compute_Loss(self, predicted_vector, gold_label):
         return self.loss(predicted_vector, gold_label)
 
     def forward(self, inputs):
-        # [to fill] obtain hidden layer representation (https://pytorch.org/docs/stable/generated/torch.nn.RNN.html)
-        _, hidden = 
-        # [to fill] obtain output layer representations
-
-        # [to fill] sum over output 
-
-        # [to fill] obtain probability dist.
-
-        return predicted_vector
-
+        # Apply embedding dropout
+        inputs = self.embedding_dropout(inputs)
+        
+        # LSTM forward pass
+        output, (h_n, c_n) = self.rnn(inputs)
+        
+        # Apply attention mechanism
+        attn_output, _ = self.attention(output, output, output)
+        
+        # Get last hidden states
+        last_hidden_forward = h_n[-2,:,:]
+        last_hidden_backward = h_n[-1,:,:]
+        last_hidden = torch.cat((last_hidden_forward, last_hidden_backward), dim=1)
+        
+        # First layer norm
+        last_hidden = self.layer_norm1(last_hidden)
+        
+        # Residual connection with attention
+        last_hidden = last_hidden + attn_output[-1]
+        
+        # Second layer norm
+        last_hidden = self.layer_norm2(last_hidden)
+        
+        # Output pathway
+        last_hidden = self.output_dropout(last_hidden)
+        intermediate = self.activation(self.intermediate(last_hidden))
+        z = self.W(intermediate)
+        
+        return self.softmax(z)
 
 def load_data(train_data, val_data):
     with open(train_data) as training_f:
@@ -77,107 +135,137 @@ if __name__ == "__main__":
     # Option 3 will be the most time consuming, so we do not recommend starting with this
 
     print("========== Vectorizing data ==========")
-    model = RNN(50, args.hidden_dim)  # Fill in parameters
-    # optimizer = optim.SGD(model.parameters(), lr=0.01, momentum=0.9)
-    optimizer = optim.Adam(model.parameters(), lr=0.01)
+    model = RNN(50, args.hidden_dim)
+    #Decreased learning rate
+    optimizer = optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-5)
     word_embedding = pickle.load(open('./word_embedding.pkl', 'rb'))
 
-    stopping_condition = False
+    # Incluuded learning rate scheduler
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode='max',
+        factor=0.5,
+        patience=2,
+        verbose=True
+    )
+
+    # Early stopping parameters
+    best_validation_accuracy = 0
+    patience = 5
+    patience_counter = 0
+    
     epoch = 0
-
-    last_train_accuracy = 0
-    last_validation_accuracy = 0
-
-    while not stopping_condition:
+    while epoch < args.epochs:
         random.shuffle(train_data)
         model.train()
-        # You will need further code to operationalize training, ffnn.py may be helpful
         print("Training started for epoch {}".format(epoch + 1))
-        train_data = train_data
+        
         correct = 0
         total = 0
-        minibatch_size = 16
+        # Increased batch size
+        minibatch_size = 64
         N = len(train_data)
 
         loss_total = 0
         loss_count = 0
+        
         for minibatch_index in tqdm(range(N // minibatch_size)):
             optimizer.zero_grad()
-            loss = None
+            batch_loss = None
+            
             for example_index in range(minibatch_size):
-                input_words, gold_label = train_data[minibatch_index * minibatch_size + example_index]
+                idx = minibatch_index * minibatch_size + example_index
+                if idx >= len(train_data):
+                    break
+                    
+                input_words, gold_label = train_data[idx]
                 input_words = " ".join(input_words)
-
-                # Remove punctuation
-                input_words = input_words.translate(input_words.maketrans("", "", string.punctuation)).split()
-
-                # Look up word embedding dictionary
-                vectors = [word_embedding[i.lower()] if i.lower() in word_embedding.keys() else word_embedding['unk'] for i in input_words ]
-
-                # Transform the input into required shape
+                input_words = input_words.translate(str.maketrans("", "", string.punctuation)).split()
+                
+                # Text augmentation
+                if random.random() < 0.1:  # 10% chance to drop words
+                    input_words = [w for w in input_words if random.random() > 0.1]
+                
+                if len(input_words) == 0:  # Skip empty sequences
+                    continue
+                
+                vectors = [word_embedding[i.lower()] if i.lower() in word_embedding.keys() 
+                          else word_embedding['unk'] for i in input_words]
+                
                 vectors = torch.tensor(vectors).view(len(vectors), 1, -1)
                 output = model(vectors)
-
-                # Get loss
-                example_loss = model.compute_Loss(output.view(1,-1), torch.tensor([gold_label]))
-
-                # Get predicted label
+                
+                example_loss = model.compute_Loss(output.view(1, -1), 
+                                                torch.tensor([gold_label]))
+                
                 predicted_label = torch.argmax(output)
-
                 correct += int(predicted_label == gold_label)
-                # print(predicted_label, gold_label)
                 total += 1
-                if loss is None:
-                    loss = example_loss
+                
+                if batch_loss is None:
+                    batch_loss = example_loss
                 else:
-                    loss += example_loss
+                    batch_loss += example_loss
 
-            loss = loss / minibatch_size
-            loss_total += loss.data
-            loss_count += 1
-            loss.backward()
-            optimizer.step()
-        print(loss_total/loss_count)
+            if total > 0:  # Only backprop if we processed some examples
+                batch_loss = batch_loss / minibatch_size
+                loss_total += batch_loss.item()
+                loss_count += 1
+                
+                # Gradient clipping
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                
+                batch_loss.backward()
+                optimizer.step()
+
+        avg_loss = loss_total / loss_count if loss_count > 0 else 0
+        print(f"Average loss: {avg_loss}")
         print("Training completed for epoch {}".format(epoch + 1))
-        print("Training accuracy for epoch {}: {}".format(epoch + 1, correct / total))
-        trainning_accuracy = correct/total
+        training_accuracy = correct / total if total > 0 else 0
+        print("Training accuracy for epoch {}: {}".format(epoch + 1, training_accuracy))
 
-
+        # Validation phase
         model.eval()
         correct = 0
         total = 0
-        random.shuffle(valid_data)
         print("Validation started for epoch {}".format(epoch + 1))
-        valid_data = valid_data
+        
+        with torch.no_grad():
+            for input_words, gold_label in tqdm(valid_data):
+                input_words = " ".join(input_words)
+                input_words = input_words.translate(str.maketrans("", "", string.punctuation)).split()
+                
+                if len(input_words) == 0:  # Skip empty sequences
+                    continue
+                    
+                vectors = [word_embedding[i.lower()] if i.lower() in word_embedding.keys() 
+                          else word_embedding['unk'] for i in input_words]
+                
+                vectors = torch.tensor(vectors).view(len(vectors), 1, -1)
+                output = model(vectors)
+                predicted_label = torch.argmax(output)
+                correct += int(predicted_label == gold_label)
+                total += 1
 
-        for input_words, gold_label in tqdm(valid_data):
-            input_words = " ".join(input_words)
-            input_words = input_words.translate(input_words.maketrans("", "", string.punctuation)).split()
-            vectors = [word_embedding[i.lower()] if i.lower() in word_embedding.keys() else word_embedding['unk'] for i
-                       in input_words]
-
-            vectors = torch.tensor(vectors).view(len(vectors), 1, -1)
-            output = model(vectors)
-            predicted_label = torch.argmax(output)
-            correct += int(predicted_label == gold_label)
-            total += 1
-            # print(predicted_label, gold_label)
         print("Validation completed for epoch {}".format(epoch + 1))
-        print("Validation accuracy for epoch {}: {}".format(epoch + 1, correct / total))
-        validation_accuracy = correct/total
+        validation_accuracy = correct / total if total > 0 else 0
+        print("Validation accuracy for epoch {}: {}".format(epoch + 1, validation_accuracy))
 
-        if validation_accuracy < last_validation_accuracy and trainning_accuracy > last_train_accuracy:
-            stopping_condition=True
-            print("Training done to avoid overfitting!")
-            print("Best validation accuracy is:", last_validation_accuracy)
+        # Learning rate scheduling
+        scheduler.step(validation_accuracy)
+        
+        # Early stopping check
+        if validation_accuracy > best_validation_accuracy:
+            best_validation_accuracy = validation_accuracy
+            patience_counter = 0
+            # Save best model
+            torch.save(model.state_dict(), 'best_model.pt')
         else:
-            last_validation_accuracy = validation_accuracy
-            last_train_accuracy = trainning_accuracy
+            patience_counter += 1
+            if patience_counter >= patience:
+                print("Early stopping! Best validation accuracy:", best_validation_accuracy)
+                # Load best model
+                model.load_state_dict(torch.load('best_model.pt'))
+                break
 
         epoch += 1
-
-
-
-    # You may find it beneficial to keep track of training accuracy or training loss;
-
-    # Think about how to update the model and what this entails. Consider ffnn.py and the PyTorch documentation for guidance
